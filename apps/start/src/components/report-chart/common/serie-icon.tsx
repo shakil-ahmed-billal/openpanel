@@ -72,6 +72,8 @@ const LUCIDE_ICONS: Record<string, React.ComponentType<LucideProps>> = {
   comment: MessageCircleIcon,
   tech: CpuIcon,
   content: BookIcon,
+  pwa: SmartphoneIcon,
+  app: SmartphoneIcon,
 
   // Misc
   unknown: HelpCircleIcon,
