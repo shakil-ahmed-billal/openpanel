@@ -1,0 +1,257 @@
+services:
+  openpanel-postgres:
+    image: postgres:16
+    container_name: openpanel-postgres
+    restart: unless-stopped
+    volumes:
+      - openpanel_postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-openpanel}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-openpanel}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  openpanel-redis:
+    image: redis:alpine
+    container_name: openpanel-redis
+    restart: unless-stopped
+    command: ["redis-server", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - openpanel_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - internal
+
+  openpanel-clickhouse:
+    image: clickhouse/clickhouse-server:26.1.3.52
+    container_name: openpanel-clickhouse
+    build:
+      context: ./docker/clickhouse
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    volumes:
+      - openpanel_clickhouse_data:/var/lib/clickhouse
+      - ./docker/clickhouse/clickhouse-config.xml:/etc/clickhouse-server/config.d/op-config.xml
+      - ./docker/clickhouse/clickhouse-user-config.xml:/etc/clickhouse-server/users.d/op-user-config.xml
+      - ./docker/clickhouse/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    environment:
+      CLICKHOUSE_DB: openpanel
+      CLICKHOUSE_SKIP_USER_SETUP: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", 'clickhouse-client --query "SELECT 1"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      internal:
+        aliases:
+          - op-ch
+
+  openpanel-redpanda:
+    image: redpandadata/redpanda:v25.1.4
+    container_name: openpanel-redpanda
+    build:
+      context: ./docker/redpanda
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://openpanel-redpanda:9092,external://localhost:19092
+      - --rpc-addr=0.0.0.0:33145
+      - --advertise-rpc-addr=openpanel-redpanda:33145
+      - --smp=1
+      - --memory=1G
+      - --mode=dev-container
+      - --default-log-level=info
+    volumes:
+      - openpanel_redpanda_data:/var/lib/redpanda/data
+      - ./docker/redpanda/bootstrap.yaml:/etc/redpanda/.bootstrap.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health -X admin.hosts=localhost:9644 | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks:
+      - internal
+
+  openpanel-api:
+    image: openpanel-api:latest
+    container_name: openpanel-api
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      args:
+        DATABASE_URL: postgresql://postgres:postgres@openpanel-postgres:5432/openpanel?schema=public
+    restart: unless-stopped
+    command: >
+      sh -c "
+        echo 'Running database migrations...'
+        cd /app/packages/db && prisma migrate deploy &&
+        cd /app/apps/api && bun run src/main.ts
+      "
+    depends_on:
+      openpanel-postgres:
+        condition: service_healthy
+      openpanel-redis:
+        condition: service_healthy
+      openpanel-clickhouse:
+        condition: service_healthy
+      openpanel-redpanda:
+        condition: service_healthy
+    environment:
+      ROLE: api
+      NODE_ENV: production
+      SELF_HOSTED: "true"
+      AUTOMATIC_MIGRATIONS: "true"
+      API_PORT: "3000"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@openpanel-postgres:5432/${POSTGRES_DB:-openpanel}?schema=public
+      DATABASE_URL_DIRECT: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@openpanel-postgres:5432/${POSTGRES_DB:-openpanel}?schema=public
+      REDIS_URL: ${REDIS_URL:-redis://openpanel-redis:6379}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://openpanel-clickhouse:8123/openpanel}
+      CLICKHOUSE_CLUSTER: ${CLICKHOUSE_CLUSTER:-false}
+      KAFKA_CLIENT_ID: ${KAFKA_CLIENT_ID:-openpanel}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-openpanel-redpanda:9092}
+      KAFKA_EVENTS_TOPIC: ${KAFKA_EVENTS_TOPIC:-events}
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-openpanel-events}
+      DASHBOARD_URL: ${DASHBOARD_URL:-https://analytics.naxtbrand.com}
+      API_URL: ${API_URL:-https://op-api.naxtbrand.com}
+      API_CORS_ORIGINS: ${API_CORS_ORIGINS:-https://analytics.naxtbrand.com}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET is required}
+      COOKIE_SECRET: ${COOKIE_SECRET:?COOKIE_SECRET is required}
+      CUSTOM_COOKIE_DOMAIN: ${CUSTOM_COOKIE_DOMAIN:-}
+      COOKIE_TLDS: ${COOKIE_TLDS:-}
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-false}
+      ALLOW_INVITATION: ${ALLOW_INVITATION:-true}
+      DISABLE_FAVICON_FETCH: ${DISABLE_FAVICON_FETCH:-false}
+      DISABLE_BULLBOARD: ${DISABLE_BULLBOARD:-false}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+      GSC_GOOGLE_REDIRECT_URI: ${GSC_GOOGLE_REDIRECT_URI:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GITHUB_REDIRECT_URI: ${GITHUB_REDIRECT_URI:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com/v1}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/healthcheck || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - internal
+      - dokploy-network
+
+  openpanel-worker:
+    image: openpanel-api:latest
+    container_name: openpanel-worker
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      args:
+        DATABASE_URL: postgresql://postgres:postgres@openpanel-postgres:5432/openpanel?schema=public
+    restart: unless-stopped
+    depends_on:
+      openpanel-api:
+        condition: service_healthy
+    environment:
+      ROLE: worker
+      NODE_ENV: production
+      SELF_HOSTED: "true"
+      AUTOMATIC_MIGRATIONS: "true"
+      API_PORT: "3000"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@openpanel-postgres:5432/${POSTGRES_DB:-openpanel}?schema=public
+      DATABASE_URL_DIRECT: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@openpanel-postgres:5432/${POSTGRES_DB:-openpanel}?schema=public
+      REDIS_URL: ${REDIS_URL:-redis://openpanel-redis:6379}
+      CLICKHOUSE_URL: ${CLICKHOUSE_URL:-http://openpanel-clickhouse:8123/openpanel}
+      CLICKHOUSE_CLUSTER: ${CLICKHOUSE_CLUSTER:-false}
+      KAFKA_CLIENT_ID: ${KAFKA_CLIENT_ID:-openpanel}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-openpanel-redpanda:9092}
+      KAFKA_EVENTS_TOPIC: ${KAFKA_EVENTS_TOPIC:-events}
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-openpanel-events}
+      DASHBOARD_URL: ${DASHBOARD_URL:-https://analytics.naxtbrand.com}
+      API_URL: ${API_URL:-https://op-api.naxtbrand.com}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET is required}
+      COOKIE_SECRET: ${COOKIE_SECRET:?COOKIE_SECRET is required}
+      DISABLE_FAVICON_FETCH: ${DISABLE_FAVICON_FETCH:-false}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-}
+      GSC_GOOGLE_REDIRECT_URI: ${GSC_GOOGLE_REDIRECT_URI:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com/v1}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/healthz/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - internal
+
+  openpanel-dashboard:
+    image: openpanel-dashboard:latest
+    container_name: openpanel-dashboard
+    build:
+      context: .
+      dockerfile: apps/start/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      openpanel-api:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      SELF_HOSTED: "true"
+      PORT: "3000"
+      DASHBOARD_URL: ${DASHBOARD_URL:-https://analytics.naxtbrand.com}
+      API_URL: ${API_URL:-https://op-api.naxtbrand.com}
+      API_URL_SSR: ${API_URL_SSR:-http://openpanel-api:3000}
+      MAINTENANCE: ${MAINTENANCE:-0}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/healthcheck || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - internal
+      - dokploy-network
+
+volumes:
+  openpanel_postgres_data:
+  openpanel_redis_data:
+  openpanel_clickhouse_data:
+  openpanel_redpanda_data:
+
+networks:
+  internal:
+  dokploy-network:
+    external: true
